@@ -30,3 +30,25 @@ services:
       KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
     depends_on:
       - kafka
+
+  sensor-simulator:
+    build:
+      context: ./producers
+      dockerfile: senso-simulator/Dockerfile
+    container_name: sensor-simulator
+    environment:
+      KAFKA_BROKER:  kafka:29092
+    depends_on:
+      - kafka
+    restart: on-failure
+
+  logistics-simulator:
+    build:
+      context: ./producers
+      dockerfile: logistics-simulator/Dockerfile
+    container_name: logistics-simulator
+    environment:
+      KAFKA_BROKER:  kafka:29092
+    depends_on:
+      - kafka
+    restart: on-failure
