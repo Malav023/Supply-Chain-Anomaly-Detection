@@ -107,18 +107,24 @@ def validate_logistics_event(raw: dict) -> Optional[str]:
 
 
 class SensorSchemaValidationFunction(ProcessFunction):
-    """Validates sensor-raw events; dead-letters malformed ones (instructions.md)."""
+    """
+    Validates sensor-raw events; dead-letters malformed ones (instructions.md).
 
-    def process_element(self, value: str, ctx: "ProcessFunction.Context") -> Iterator[str]:
+    NOTE: PyFlink's ProcessFunction.Context has no .output() method (that's
+    Java-API only). Side outputs in PyFlink are emitted by yielding a
+    (output_tag, value) tuple from this generator, same as a normal yield.
+    """
+
+    def process_element(self, value: str, ctx: "ProcessFunction.Context") -> Iterator:
         try:
             raw = json.loads(value)
         except (json.JSONDecodeError, TypeError):
-            ctx.output(SENSOR_DEAD_LETTER_TAG, json.dumps({"reason": "invalid_json", "raw": value}))
+            yield SENSOR_DEAD_LETTER_TAG, json.dumps({"reason": "invalid_json", "raw": value})
             return
 
         reason = validate_sensor_event(raw)
         if reason is not None:
-            ctx.output(SENSOR_DEAD_LETTER_TAG, json.dumps({"reason": reason, "raw": raw}))
+            yield SENSOR_DEAD_LETTER_TAG, json.dumps({"reason": reason, "raw": raw})
             return
 
         yield json.dumps(raw)
@@ -127,16 +133,16 @@ class SensorSchemaValidationFunction(ProcessFunction):
 class LogisticsSchemaValidationFunction(ProcessFunction):
     """Validates logistics-events; dead-letters malformed ones (instructions.md)."""
 
-    def process_element(self, value: str, ctx: "ProcessFunction.Context") -> Iterator[str]:
+    def process_element(self, value: str, ctx: "ProcessFunction.Context") -> Iterator:
         try:
             raw = json.loads(value)
         except (json.JSONDecodeError, TypeError):
-            ctx.output(LOGISTICS_DEAD_LETTER_TAG, json.dumps({"reason": "invalid_json", "raw": value}))
+            yield LOGISTICS_DEAD_LETTER_TAG, json.dumps({"reason": "invalid_json", "raw": value})
             return
 
         reason = validate_logistics_event(raw)
         if reason is not None:
-            ctx.output(LOGISTICS_DEAD_LETTER_TAG, json.dumps({"reason": reason, "raw": raw}))
+            yield LOGISTICS_DEAD_LETTER_TAG, json.dumps({"reason": reason, "raw": raw})
             return
 
         yield json.dumps(raw)
@@ -175,15 +181,12 @@ class RemapToShipmentFunction(ProcessFunction):
     with no known mapping are dead-lettered rather than dropped silently.
     """
 
-    def process_element(self, value: str, ctx: "ProcessFunction.Context") -> Iterator[str]:
+    def process_element(self, value: str, ctx: "ProcessFunction.Context") -> Iterator:
         event = json.loads(value)
         shipment_id = TRUCK_TO_SHIPMENT.get(event["sensor_id"])
 
         if shipment_id is None:
-            ctx.output(
-                SENSOR_DEAD_LETTER_TAG,
-                json.dumps({"reason": "unmapped_shipment", "raw": event}),
-            )
+            yield SENSOR_DEAD_LETTER_TAG, json.dumps({"reason": "unmapped_shipment", "raw": event})
             return
 
         event["shipment_id"] = shipment_id
@@ -193,15 +196,15 @@ class RemapToShipmentFunction(ProcessFunction):
 class SensorLogisticsJoinFunction(KeyedCoProcessFunction):
     """
     Stream-table join, keyed by shipment_id (architecture.md §4).
-    Stream 1 (process_element1) = logistics-events: updates the reference
-    "table" state (route, carrier, status, expected_eta) for this shipment.
-    Stream 2 (process_element2) = sensor readings: enriched with the latest
-    known shipment reference data and emitted.
+    process_element1 = logistics-events: updates the reference "table"
+    state (route, carrier, status, expected_eta) for this shipment.
+    process_element2 = sensor readings: enriched with the latest known
+    shipment reference data and emitted.
 
     If no logistics data has arrived yet for a shipment_id, the sensor
     event is still emitted (not dropped — instructions.md's general rule
     is fail gracefully, not silently discard) with enrichment fields null
-    and enriched=false, so downstream stages can distinguish the two cases.
+    and enriched=false.
     """
 
     def open(self, runtime_context):
@@ -209,13 +212,11 @@ class SensorLogisticsJoinFunction(KeyedCoProcessFunction):
         self.shipment_state = runtime_context.get_state(descriptor)
 
     def process_element1(self, value: str, ctx: "KeyedCoProcessFunction.Context") -> Iterator[str]:
-        # logistics-events side: update the reference table for this shipment_id
         self.shipment_state.update(value)
         return
         yield  # pragma: no cover — makes this a generator, emits nothing
 
     def process_element2(self, value: str, ctx: "KeyedCoProcessFunction.Context") -> Iterator[str]:
-        # sensor side: join against current reference state
         sensor_event = json.loads(value)
         reference_raw = self.shipment_state.value()
 
