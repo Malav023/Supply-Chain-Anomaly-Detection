@@ -90,7 +90,13 @@ services:
       TOPIC_SENSOR_DEADLETTER: sensor-raw-dead-letter
       TOPIC_LOGISTICS_EVENTS: logistics-events
       TOPIC_LOGISTICS_DEADLETTER: logistics-events-dead-letter
+      TOPIC_NORMALIZED_EVENTS: normalized-events
+      TOPIC_LATE_EVENTS: late-events
       DEDUP_STATE_TTL_MS: 300000
+      FLINK_ALLOWED_LATENESS_MS: 120000
+      WATERMARK_MAX_OUT_OF_ORDERNESS_MS: 2000
+      COLD_CHAIN_WINDOW_SECONDS: 10
+      GPS_SESSION_GAP_SECONDS: 5
     depends_on:
       - kafka
       - flink-jobmanager

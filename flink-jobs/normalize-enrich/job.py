@@ -1,11 +1,14 @@
 import json
+import math
 import os
 import re
+from datetime import datetime, timezone
 from typing import Iterator, Optional
 
-from pyflink.common import Types, WatermarkStrategy
+from pyflink.common import Types, WatermarkStrategy, Duration
 from pyflink.common.time import Time
 from pyflink.common.serialization import SimpleStringSchema
+from pyflink.common.watermark_strategy import TimestampAssigner
 from pyflink.datastream import StreamExecutionEnvironment, OutputTag
 from pyflink.datastream.connectors.kafka import (
     KafkaSource,
@@ -17,8 +20,10 @@ from pyflink.datastream.functions import (
     ProcessFunction,
     KeyedProcessFunction,
     KeyedCoProcessFunction,
+    ProcessWindowFunction,
 )
 from pyflink.datastream.state import ValueStateDescriptor, StateTtlConfig
+from pyflink.datastream.window import TumblingEventTimeWindows, EventTimeSessionWindows
 
 
 SENSOR_ID_PATTERN = re.compile(r"^truck-\d{3}$")
@@ -26,10 +31,17 @@ SHIPMENT_ID_PATTERN = re.compile(r"^ship-\d+$")
 ROUTE_PATTERN = re.compile(r"^[A-Z]{2,4}-[A-Z]{2,4}$")
 ISO8601_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z$")
 
-VALID_LOGISTICS_STATUSES = {"pending", "in_transit", "delayed", "delivered", "cancelled"}
+# Superset enum agreed on: docs updated to match every status either the
+# original simulator or data-model.md's original draft ever needed —
+# see data-model.md, logistics-events section.
+VALID_LOGISTICS_STATUSES = {
+    "pending", "dispatched", "in_transit", "out_for_delivery",
+    "delayed", "delivered", "cancelled",
+}
 
 SENSOR_DEAD_LETTER_TAG = OutputTag("sensor-dead-letter", Types.STRING())
 LOGISTICS_DEAD_LETTER_TAG = OutputTag("logistics-dead-letter", Types.STRING())
+LATE_DATA_TAG = OutputTag("late-events", Types.STRING())
 
 # Config from environment — see instructions.md §1, "No hardcoded config"
 KAFKA_BROKER = os.environ.get("KAFKA_BROKER", "kafka:29092")
@@ -37,7 +49,13 @@ TOPIC_SENSOR_RAW = os.environ.get("TOPIC_SENSOR_RAW", "sensor-raw")
 TOPIC_SENSOR_DEADLETTER = os.environ.get("TOPIC_SENSOR_DEADLETTER", "sensor-raw-dead-letter")
 TOPIC_LOGISTICS_EVENTS = os.environ.get("TOPIC_LOGISTICS_EVENTS", "logistics-events")
 TOPIC_LOGISTICS_DEADLETTER = os.environ.get("TOPIC_LOGISTICS_DEADLETTER", "logistics-events-dead-letter")
+TOPIC_NORMALIZED_EVENTS = os.environ.get("TOPIC_NORMALIZED_EVENTS", "normalized-events")
+TOPIC_LATE_EVENTS = os.environ.get("TOPIC_LATE_EVENTS", "late-events")
 DEDUP_STATE_TTL_MS = int(os.environ.get("DEDUP_STATE_TTL_MS", "300000"))
+FLINK_ALLOWED_LATENESS_MS = int(os.environ.get("FLINK_ALLOWED_LATENESS_MS", "120000"))
+WATERMARK_MAX_OUT_OF_ORDERNESS_MS = int(os.environ.get("WATERMARK_MAX_OUT_OF_ORDERNESS_MS", "2000"))
+COLD_CHAIN_WINDOW_SECONDS = int(os.environ.get("COLD_CHAIN_WINDOW_SECONDS", "10"))
+GPS_SESSION_GAP_SECONDS = int(os.environ.get("GPS_SESSION_GAP_SECONDS", "5"))
 
 # ASSUMPTION (flagged, not derived from data): static truck-to-shipment
 # pairing, since neither sensor-raw nor logistics-events carries a shared
@@ -56,6 +74,16 @@ TRUCK_TO_SHIPMENT = {
 
 def _is_number(value) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Great-circle distance between two GPS points, in kilometers."""
+    r = 6371.0
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    d_lat = math.radians(lat2 - lat1)
+    d_lon = math.radians(lon2 - lon1)
+    a = math.sin(d_lat / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(d_lon / 2) ** 2
+    return r * 2 * math.asin(math.sqrt(a))
 
 
 def validate_sensor_event(raw: dict) -> Optional[str]:
@@ -200,11 +228,6 @@ class SensorLogisticsJoinFunction(KeyedCoProcessFunction):
     state (route, carrier, status, expected_eta) for this shipment.
     process_element2 = sensor readings: enriched with the latest known
     shipment reference data and emitted.
-
-    If no logistics data has arrived yet for a shipment_id, the sensor
-    event is still emitted (not dropped — instructions.md's general rule
-    is fail gracefully, not silently discard) with enrichment fields null
-    and enriched=false.
     """
 
     def open(self, runtime_context):
@@ -243,9 +266,136 @@ class SensorLogisticsJoinFunction(KeyedCoProcessFunction):
         yield json.dumps(enriched)
 
 
+class EnrichedTimestampAssigner(TimestampAssigner):
+    """
+    Extracts event time from the enriched record's original sensor
+    'timestamp' field (ISO8601, always millisecond-precision from
+    TruckSensor's toISOString() output), for use by the watermark
+    strategy driving window Step 5.
+    """
+
+    def extract_timestamp(self, value: str, record_timestamp: int) -> int:
+        event = json.loads(value)
+        dt = datetime.strptime(event["timestamp"], "%Y-%m-%dT%H:%M:%S.%fZ")
+        return int(dt.replace(tzinfo=timezone.utc).timestamp() * 1000)
+
+
+class ColdChainWindowFunction(ProcessWindowFunction):
+    """
+    Tumbling 10s window per sensor_id (architecture.md's "fixed sensor"
+    style aggregation), summarizing temperature/humidity/vibration —
+    the cold-chain telemetry fields, as opposed to positional GPS data.
+    """
+
+    def process(self, key: str, context: "ProcessWindowFunction.Context", elements) -> Iterator[str]:
+        temps, humidities, vibrations = [], [], []
+        shipment_id = carrier = route = status = expected_eta = None
+        last_ts = None
+
+        for value in elements:
+            event = json.loads(value)
+            temps.append(event["temperature"])
+            humidities.append(event["humidity"])
+            vibrations.append(event["vibration"])
+            shipment_id = event.get("shipment_id")
+            carrier = event.get("carrier")
+            route = event.get("route")
+            status = event.get("status")
+            expected_eta = event.get("expected_eta")
+            last_ts = event["timestamp"]
+
+        if not temps:
+            return
+
+        window = context.window()
+        summary = {
+            "window_type": "cold_chain_tumbling",
+            "sensor_id": key,
+            "shipment_id": shipment_id,
+            "carrier": carrier,
+            "route": route,
+            "status": status,
+            "expected_eta": expected_eta,
+            "window_start": window.start,
+            "window_end": window.end,
+            "reading_count": len(temps),
+            "avg_temperature": round(sum(temps) / len(temps), 3),
+            "min_temperature": round(min(temps), 3),
+            "max_temperature": round(max(temps), 3),
+            "avg_humidity": round(sum(humidities) / len(humidities), 3),
+            "avg_vibration": round(sum(vibrations) / len(vibrations), 3),
+            "max_vibration": round(max(vibrations), 3),
+            "last_event_timestamp": last_ts,
+            "is_late": False,
+        }
+        yield json.dumps(summary)
+
+
+class GpsSessionWindowFunction(ProcessWindowFunction):
+    """
+    Session window (5s inactivity gap) per sensor_id (architecture.md's
+    "GPS/mobile sensor" style aggregation), summarizing a continuous
+    movement segment into a start/end point pair and total distance.
+    """
+
+    def process(self, key: str, context: "ProcessWindowFunction.Context", elements) -> Iterator[str]:
+        points = []
+        shipment_id = carrier = route = None
+
+        for value in elements:
+            event = json.loads(value)
+            points.append({
+                "lat": event["gps"]["lat"],
+                "lon": event["gps"]["lon"],
+                "timestamp": event["timestamp"],
+            })
+            shipment_id = event.get("shipment_id")
+            carrier = event.get("carrier")
+            route = event.get("route")
+
+        if not points:
+            return
+
+        points.sort(key=lambda p: p["timestamp"])
+        distance_km = 0.0
+        for i in range(1, len(points)):
+            distance_km += _haversine_km(
+                points[i - 1]["lat"], points[i - 1]["lon"],
+                points[i]["lat"], points[i]["lon"],
+            )
+
+        window = context.window()
+        summary = {
+            "window_type": "gps_session",
+            "sensor_id": key,
+            "shipment_id": shipment_id,
+            "carrier": carrier,
+            "route": route,
+            "window_start": window.start,
+            "window_end": window.end,
+            "point_count": len(points),
+            "start_point": points[0],
+            "end_point": points[-1],
+            "distance_km": round(distance_km, 4),
+            "is_late": False,
+        }
+        yield json.dumps(summary)
+
+
+def _wrap_late_event(window_type: str, raw_value: str) -> str:
+    """Wraps a raw enriched event that missed its window (see
+    instructions.md, Error Handling Strategy — Late data)."""
+    return json.dumps({
+        "reason": "late_arrival",
+        "window_type": window_type,
+        "is_late": True,
+        "raw": json.loads(raw_value),
+    })
+
+
 def main() -> None:
     env = StreamExecutionEnvironment.get_execution_environment()
-    env.set_parallelism(1)  # revisit once windowing is added
+    env.set_parallelism(1)  # revisit once ML scoring (Phase 3) is added
 
     sensor_source = (
         KafkaSource.builder()
@@ -326,11 +476,79 @@ def main() -> None:
         .process(SensorLogisticsJoinFunction(), Types.STRING())
     )
 
-    # Temporary: print enriched events so we can confirm the join end-to-end
-    # before wiring windowing (next step) and the final normalized-events sink.
-    joined.print()
+    # --- Step 5: assign event-time watermarks on the enriched stream ---
+    # Bounded-out-of-orderness is deliberately small (default 2s) since
+    # the simulators emit in near-order over a local Docker network;
+    # this is distinct from FLINK_ALLOWED_LATENESS_MS, which controls
+    # how long a *window* stays open for stragglers, not watermark drift.
+    watermark_strategy = (
+        WatermarkStrategy
+        .for_bounded_out_of_orderness(Duration.of_millis(WATERMARK_MAX_OUT_OF_ORDERNESS_MS))
+        .with_timestamp_assigner(EnrichedTimestampAssigner())
+    )
+    enriched_with_watermarks = joined.assign_timestamps_and_watermarks(watermark_strategy)
 
-    env.execute("normalize-enrich-sensor-logistics-join")
+    # --- Branch A: cold-chain tumbling window (temperature/humidity/vibration) ---
+    cold_chain_windowed = (
+        enriched_with_watermarks
+        .key_by(lambda event: json.loads(event)["sensor_id"], key_type=Types.STRING())
+        .window(TumblingEventTimeWindows.of(Time.seconds(COLD_CHAIN_WINDOW_SECONDS)))
+        .allowed_lateness(FLINK_ALLOWED_LATENESS_MS)
+        .side_output_late_data(LATE_DATA_TAG)
+        .process(ColdChainWindowFunction(), Types.STRING())
+    )
+    cold_chain_late = cold_chain_windowed.get_side_output(LATE_DATA_TAG).map(
+        lambda raw: _wrap_late_event("cold_chain_tumbling", raw), output_type=Types.STRING()
+    )
+
+    # --- Branch B: GPS session window (movement segments) ---
+    gps_windowed = (
+        enriched_with_watermarks
+        .key_by(lambda event: json.loads(event)["sensor_id"], key_type=Types.STRING())
+        .window(EventTimeSessionWindows.with_gap(Time.seconds(GPS_SESSION_GAP_SECONDS)))
+        .allowed_lateness(FLINK_ALLOWED_LATENESS_MS)
+        .side_output_late_data(LATE_DATA_TAG)
+        .process(GpsSessionWindowFunction(), Types.STRING())
+    )
+    gps_late = gps_windowed.get_side_output(LATE_DATA_TAG).map(
+        lambda raw: _wrap_late_event("gps_session", raw), output_type=Types.STRING()
+    )
+
+    # --- Sinks: normalized-events (both window shapes) and late-events ---
+    normalized_events_sink = (
+        KafkaSink.builder()
+        .set_bootstrap_servers(KAFKA_BROKER)
+        .set_record_serializer(
+            KafkaRecordSerializationSchema.builder()
+            .set_topic(TOPIC_NORMALIZED_EVENTS)
+            .set_value_serialization_schema(SimpleStringSchema())
+            .build()
+        )
+        .build()
+    )
+    cold_chain_windowed.sink_to(normalized_events_sink)
+    gps_windowed.sink_to(normalized_events_sink)
+
+    late_events_sink = (
+        KafkaSink.builder()
+        .set_bootstrap_servers(KAFKA_BROKER)
+        .set_record_serializer(
+            KafkaRecordSerializationSchema.builder()
+            .set_topic(TOPIC_LATE_EVENTS)
+            .set_value_serialization_schema(SimpleStringSchema())
+            .build()
+        )
+        .build()
+    )
+    cold_chain_late.sink_to(late_events_sink)
+    gps_late.sink_to(late_events_sink)
+
+    # Temporary: print windowed output so we can visually confirm both
+    # window types populate correctly before moving to Phase 3 (ML scoring).
+    cold_chain_windowed.print()
+    gps_windowed.print()
+
+    env.execute("normalize-enrich-phase2-full-pipeline")
 
 
 if __name__ == "__main__":

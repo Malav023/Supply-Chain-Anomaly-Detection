@@ -1,5 +1,5 @@
 class Shipment {
-  static STATUSES = ['dispatched', 'in_transit', 'out_for_delivery', 'delayed', 'delivered'];
+  static STATUSES = ['pending', 'dispatched', 'in_transit', 'out_for_delivery', 'delivered'];
   static CARRIERS = ['carrier-A', 'carrier-B', 'carrier-C', 'carrier-FastTrack'];
   static ROUTES = ['NYC-BOS', 'CHI-DET', 'LAX-SFO', 'SEA-PDX', 'MIA-ATL'];
 
@@ -11,11 +11,15 @@ class Shipment {
   }
 
   generateEvent() {
-    // Advance status or pick a random active status
-    const isDelayed = Math.random() < 0.2;
+    // 20% chance of a delay, 2% chance of a cancellation (rare, non-linear
+    // overrides). Otherwise, cycle forward through the normal lifecycle:
+    // pending -> dispatched -> in_transit -> out_for_delivery -> delivered.
+    const roll = Math.random();
     let status;
 
-    if (isDelayed) {
+    if (roll < 0.02) {
+      status = 'cancelled';
+    } else if (roll < 0.22) {
       status = 'delayed';
     } else {
       status = Shipment.STATUSES[this.statusIndex % Shipment.STATUSES.length];
